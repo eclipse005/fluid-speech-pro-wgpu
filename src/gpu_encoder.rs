@@ -108,6 +108,12 @@ const SINGLE_SUBMIT_MAX_STEPS: usize = 512;
 /// Past this (~5.5 min), `attn_softmax.wgsl` runs in-place in `weights` with 1 KiB smem.
 const ATTN_SOFTMAX_SMEM_MAX: usize = 4096;
 
+/// Workgroup storage `attn_softmax_smem.wgsl` declares: `row: array<f32, 4096>` plus
+/// `reduce: array<f32, 256>`, i.e. 16 KiB + 1 KiB. An adapter whose
+/// `max_compute_workgroup_storage_size` is below this rejects the pipeline at creation,
+/// so the stage is skipped there and `attn_softmax.wgsl` handles every utterance.
+const ATTN_SOFTMAX_SMEM_BYTES: u32 = 17_408;
+
 /// Padded widths the GEMM attention needs for a given frame count.
 ///
 /// The score GEMMs write `vec4`s along `n`, so `n` must divide by four; the context
@@ -366,8 +372,10 @@ pub struct EncoderScratchGpu {
     /// GEMM-based attention: gather, two score GEMMs, softmax, context GEMM, scatter.
     attn_prepare: CachedPipeline,
     attn_softmax: CachedPipeline,
-    /// Shared-memory fast path for `steps <= ATTN_SOFTMAX_SMEM_MAX` (shares `attn_softmax.layout`).
-    attn_softmax_smem: wgpu::ComputePipeline,
+    /// Shared-memory fast path for `steps <= ATTN_SOFTMAX_SMEM_MAX` (shares
+    /// `attn_softmax.layout`). `None` on adapters whose workgroup storage cannot hold
+    /// [`ATTN_SOFTMAX_SMEM_BYTES`]; the global-memory kernel then runs instead.
+    attn_softmax_smem: Option<wgpu::ComputePipeline>,
     attn_scatter: CachedPipeline,
     /// Fused Flash-style sliding-window relative-position local attention (`rel_pos_local_attn`).
     attn_local: CachedPipeline,
@@ -558,7 +566,9 @@ impl EncoderScratchGpu {
             });
         let axpy = axpy_cached.pipeline;
         let axpy_layout = axpy_cached.layout;
-        let attn_softmax_smem = {
+        let attn_softmax_smem = if gpu.dev().limits().max_compute_workgroup_storage_size
+            >= ATTN_SOFTMAX_SMEM_BYTES
+        {
             let device = gpu.dev();
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("attn_softmax_smem"),
@@ -569,14 +579,16 @@ impl EncoderScratchGpu {
                 bind_group_layouts: &[Some(&attn_softmax.layout)],
                 immediate_size: 0,
             });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("attn_softmax_smem"),
                 layout: Some(&pipeline_layout),
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: gpu.pipeline_cache(),
-            })
+            }))
+        } else {
+            None
         };
 
         // Allocated before the struct literal: field initialisers run in order, so
@@ -2322,10 +2334,9 @@ impl EncoderGpu {
                         p_pad,
                         HEAD_DIM,
                     );
-                    let softmax_p = if steps <= ATTN_SOFTMAX_SMEM_MAX {
-                        &s.attn_softmax_smem
-                    } else {
-                        &s.attn_softmax.pipeline
+                    let softmax_p = match &s.attn_softmax_smem {
+                        Some(smem) if steps <= ATTN_SOFTMAX_SMEM_MAX => smem,
+                        _ => &s.attn_softmax.pipeline,
                     };
                     dispatch_in(
                         &mut pass,
@@ -2770,10 +2781,9 @@ impl EncoderGpu {
                     + HEAD_DIM * k_pad;
                 let (prep_x, prep_y) = crate::gpu::grid_2d(prepare_total.div_ceil(256));
                 let (scat_x, scat_y) = crate::gpu::grid_2d((steps * HEAD_DIM).div_ceil(256));
-                let softmax_p = if steps <= ATTN_SOFTMAX_SMEM_MAX {
-                    &s.attn_softmax_smem
-                } else {
-                    &s.attn_softmax.pipeline
+                let softmax_p = match &s.attn_softmax_smem {
+                    Some(smem) if steps <= ATTN_SOFTMAX_SMEM_MAX => smem,
+                    _ => &s.attn_softmax.pipeline,
                 };
                 for head in 0..HEADS {
                     dispatch_in(

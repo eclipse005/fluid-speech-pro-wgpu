@@ -40,6 +40,7 @@ pub use crate::confidence::{
 };
 pub use crate::conformer::AttentionModel;
 pub use crate::fusion::{ArpaLm, BoostingTree, BoostingTreeConfig, DEFAULT_TOKEN_OFFSET};
+pub use crate::gpu::DeviceSelector;
 pub use crate::tdt::{AlignmentEntry, DecoderState, FrameAlignment};
 pub use crate::text::{CharTimestamp, Segment, TimestampConfig, TimestampType, Word};
 
@@ -85,6 +86,10 @@ impl Backend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadOptions {
     pub backend: Backend,
+    /// Which adapter the GPU backend opens (`Auto` by default: the best real GPU).
+    /// Ignored for [`Backend::Cpu`]. Parse one with [`DeviceSelector::parse`]
+    /// (`"metal"`, `"vulkan:1"`, `"#2"`, an adapter-name substring).
+    pub device_selector: DeviceSelector,
     /// Enable Fluid Speech Pro's edited (non-verbatim) clean mode, which folds the
     /// checkpoint's `clean_mode.*` LoRA and bias adapters (`alpha / rank`) into the
     /// model weights in memory. Mirrors `fluid_speech.load(..., clean_mode=True)`.
@@ -99,6 +104,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             backend: Backend::Cpu,
+            device_selector: DeviceSelector::Auto,
             clean_mode: false,
             attention_model: AttentionModel::RelPos,
         }
@@ -109,9 +115,15 @@ impl LoadOptions {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
+            device_selector: DeviceSelector::Auto,
             clean_mode: false,
             attention_model: AttentionModel::RelPos,
         }
+    }
+
+    pub fn with_device_selector(mut self, selector: DeviceSelector) -> Self {
+        self.device_selector = selector;
+        self
     }
 
     pub fn with_clean_mode(mut self, enabled: bool) -> Self {
@@ -381,7 +393,7 @@ impl Transcriber {
                 }))
             }
             Backend::Gpu => {
-                let gpu = Arc::new(crate::gpu::GpuGemm::new()?);
+                let gpu = Arc::new(crate::gpu::GpuGemm::new_on(&options.device_selector)?);
                 let pre = crate::pre_encode_gpu::PreEncodeGpu::new(Arc::clone(&gpu), &store)?;
                 let insert = crate::fv_insert_gpu::FvInsertGpu::new(
                     Arc::clone(&gpu),
@@ -426,6 +438,15 @@ impl Transcriber {
     /// Whether Fluid Speech Pro's edited `clean_mode` adapter was folded at load time.
     pub fn clean_mode(&self) -> bool {
         self.clean_mode
+    }
+
+    /// What the loaded stages run on: `"cpu"`, or the adapter's one-line description
+    /// (`"NVIDIA GeForce GTX 1080 (Vulkan, DiscreteGpu)"`).
+    pub fn device_description(&self) -> String {
+        match &self.stages {
+            Stages::Cpu(_) => "cpu".to_string(),
+            Stages::Gpu(device) => device.encoder.gpu().adapter_description().to_string(),
+        }
     }
 
     /// Current Conformer self-attention model (`RelPos` or `RelPosLocalAttn`).

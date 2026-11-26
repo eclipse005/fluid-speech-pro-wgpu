@@ -235,6 +235,232 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
     Some(root.join("fluid-speech-pro").join(format!("{key}.pipeline_cache")))
 }
 
+/// Which adapter to open: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
+///
+/// Same shape as the selector the sibling `qwen3-asr-wgpu` / `ctc-forced-aligner-wgpu`
+/// crates expose, so a host that embeds several of them passes one vocabulary of specs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeviceSelector {
+    #[default]
+    Auto,
+    Runtime {
+        api: wgpu::Backend,
+        index: usize,
+    },
+    Cpu,
+    Index(usize),
+    Name(String),
+}
+
+/// Runtime spellings [`DeviceSelector::parse`] accepts, with their wgpu backend.
+const RUNTIMES: &[(&str, wgpu::Backend)] = &[
+    ("vulkan", wgpu::Backend::Vulkan),
+    ("metal", wgpu::Backend::Metal),
+    ("dx12", wgpu::Backend::Dx12),
+    ("d3d12", wgpu::Backend::Dx12),
+    ("gl", wgpu::Backend::Gl),
+];
+
+impl DeviceSelector {
+    /// Parses one spec: empty/`auto`, `cpu`, `#n` or `n` (adapter index), a runtime
+    /// (`vulkan`, `metal`, `dx12`, `d3d12`, `gl`, optionally `:<index>`), or an adapter
+    /// name substring (matched case-insensitively).
+    pub fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() || spec.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if spec.eq_ignore_ascii_case("cpu") {
+            return Ok(Self::Cpu);
+        }
+        if spec.eq_ignore_ascii_case("gpu") {
+            bail!("`gpu` is a backend, not an adapter name — use Backend::Gpu");
+        }
+        if let Some(rest) = spec.strip_prefix('#') {
+            return Ok(Self::Index(rest.trim().parse().context("device index")?));
+        }
+        if let Ok(index) = spec.parse::<usize>() {
+            return Ok(Self::Index(index));
+        }
+        let (name, index) = match spec.split_once(':') {
+            Some((name, index)) => (name, index.trim().parse().context("runtime device index")?),
+            None => (spec, 0usize),
+        };
+        if let Some((_, api)) = RUNTIMES
+            .iter()
+            .find(|(runtime, _)| name.eq_ignore_ascii_case(runtime))
+        {
+            return Ok(Self::Runtime { api: *api, index });
+        }
+        Ok(Self::Name(spec.to_lowercase()))
+    }
+}
+
+/// Most preferred API first. On macOS, native Metal beats MoltenVK; on Windows and
+/// Linux, Vulkan leads while DX12-only Windows hosts fall through cleanly.
+#[cfg(target_os = "macos")]
+const API_RANK_ORDER: [wgpu::Backend; 4] = [
+    wgpu::Backend::Metal,
+    wgpu::Backend::Vulkan,
+    wgpu::Backend::Dx12,
+    wgpu::Backend::Gl,
+];
+
+#[cfg(not(target_os = "macos"))]
+const API_RANK_ORDER: [wgpu::Backend; 4] = [
+    wgpu::Backend::Vulkan,
+    wgpu::Backend::Metal,
+    wgpu::Backend::Dx12,
+    wgpu::Backend::Gl,
+];
+
+/// Index in [`API_RANK_ORDER`], or 4 for a backend not listed there. Lower is better.
+fn api_rank(backend: wgpu::Backend) -> u8 {
+    API_RANK_ORDER
+        .iter()
+        .position(|b| *b == backend)
+        .map_or(4, |i| i as u8)
+}
+
+/// Every native backend a desktop build can expose.
+const ALL_GPU_BACKENDS: wgpu::Backends = wgpu::Backends::VULKAN
+    .union(wgpu::Backends::METAL)
+    .union(wgpu::Backends::DX12)
+    .union(wgpu::Backends::GL);
+
+/// Discrete, then integrated, then virtual. A CPU adapter is not a GPU.
+fn device_class(kind: wgpu::DeviceType) -> u8 {
+    match kind {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 3,
+        _ => 4,
+    }
+}
+
+/// How [`DeviceSelector::Auto`] and [`DeviceSelector::Name`] order candidates: fastest
+/// device class first, then the API that talks to it most directly.
+fn rank(device_type: wgpu::DeviceType, backend: wgpu::Backend) -> (u8, u8) {
+    (device_class(device_type), api_rank(backend))
+}
+
+/// The device classes [`DeviceSelector::Auto`] will consider. A CPU adapter (WARP,
+/// llvmpipe/lavapipe) renders in software and is never a candidate.
+fn is_real_gpu(device_type: wgpu::DeviceType) -> bool {
+    matches!(
+        device_type,
+        wgpu::DeviceType::DiscreteGpu
+            | wgpu::DeviceType::IntegratedGpu
+            | wgpu::DeviceType::VirtualGpu
+    )
+}
+
+/// One instance restricted to `backends`.
+///
+/// A Vulkan-only instance enumerates in ~3 ms; `Instance::default()` loads every
+/// runtime's loader first, which is most of a second on Windows.
+async fn adapters_for(backends: wgpu::Backends) -> Vec<wgpu::Adapter> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = backends;
+    wgpu::Instance::new(descriptor)
+        .enumerate_adapters(backends)
+        .await
+}
+
+fn list_names(adapters: &[wgpu::Adapter]) -> String {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let info = a.get_info();
+            format!(
+                "#{i} {} ({:?}, {:?})",
+                info.name, info.backend, info.device_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sort_by_rank(adapters: &mut [wgpu::Adapter]) {
+    adapters.sort_by_key(|a| {
+        let info = a.get_info();
+        rank(info.device_type, info.backend)
+    });
+}
+
+/// Resolves `selector` to an open adapter.
+async fn pick_adapter(selector: &DeviceSelector) -> Result<wgpu::Adapter> {
+    match selector {
+        DeviceSelector::Cpu => bail!("DeviceSelector::Cpu cannot open a GPU adapter"),
+        DeviceSelector::Auto => {
+            // Lazily walk the backends in rank order and stop at the first one that
+            // exposes a discrete GPU: on Windows that is Vulkan's first adapter, so a
+            // discrete card costs one enumeration, while Metal-only and DX12-only hosts
+            // fall through to the backend they actually have.
+            let mut gpus: Vec<wgpu::Adapter> = Vec::new();
+            for api in API_RANK_ORDER {
+                let found = adapters_for(wgpu::Backends::from(api)).await;
+                let discrete = found
+                    .iter()
+                    .any(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu);
+                gpus.extend(
+                    found
+                        .into_iter()
+                        .filter(|a| is_real_gpu(a.get_info().device_type)),
+                );
+                if discrete {
+                    break;
+                }
+            }
+            if gpus.is_empty() {
+                bail!("no GPU adapter found (auto)");
+            }
+            sort_by_rank(&mut gpus);
+            Ok(gpus.remove(0))
+        }
+        DeviceSelector::Runtime { api, index } => {
+            let mut found = adapters_for(wgpu::Backends::from(*api)).await;
+            sort_by_rank(&mut found);
+            if *index >= found.len() {
+                bail!(
+                    "{api:?} exposes {} adapter(s), index {index} is out of range: {}",
+                    found.len(),
+                    list_names(&found)
+                );
+            }
+            Ok(found.remove(*index))
+        }
+        DeviceSelector::Index(index) => {
+            let mut found = adapters_for(ALL_GPU_BACKENDS).await;
+            if *index >= found.len() {
+                bail!(
+                    "{index} is out of range: {} adapter(s) visible: {}",
+                    found.len(),
+                    list_names(&found)
+                );
+            }
+            Ok(found.swap_remove(*index))
+        }
+        DeviceSelector::Name(needle) => {
+            let found = adapters_for(ALL_GPU_BACKENDS).await;
+            let visible = list_names(&found);
+            let mut hits: Vec<wgpu::Adapter> = found
+                .into_iter()
+                .filter(|a| a.get_info().name.to_lowercase().contains(needle))
+                .collect();
+            if hits.is_empty() {
+                bail!("no adapter name contains `{needle}` (visible: {visible})");
+            }
+            // Class before API, so a discrete GPU wins over an integrated one that
+            // happens to sit on an earlier-ranked backend.
+            sort_by_rank(&mut hits);
+            Ok(hits.remove(0))
+        }
+    }
+}
+
 pub struct GpuGemm {
     tile: Tile,
     tile_override: bool,
@@ -254,24 +480,22 @@ pub struct GpuGemm {
     dw_conv: wgpu::ComputePipeline,
     dw_conv_layout: wgpu::BindGroupLayout,
     adapter: String,
+    adapter_description: String,
 }
 
 impl GpuGemm {
+    /// Opens the adapter [`DeviceSelector::Auto`] picks: the best real GPU, discrete first.
     pub fn new() -> Result<Self> {
-        // A Vulkan-only instance enumerates in ~3 ms; `Instance::default()` loads
-        // every runtime's loader first, which is most of a second on Windows.
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::VULKAN;
-        let instance = wgpu::Instance::new(descriptor);
+        Self::new_on(&DeviceSelector::Auto)
+    }
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .context("no GPU adapter")?;
+    /// Opens the adapter `selector` names.
+    pub fn new_on(selector: &DeviceSelector) -> Result<Self> {
+        let adapter = pollster::block_on(pick_adapter(selector))?;
+        Self::with_adapter(adapter)
+    }
 
+    fn with_adapter(adapter: wgpu::Adapter) -> Result<Self> {
         let info = adapter.get_info();
         let features = adapter.features();
         let limits = adapter.limits();
@@ -437,6 +661,10 @@ impl GpuGemm {
             dw_conv,
             dw_conv_layout,
             adapter: format!("{info:?}"),
+            adapter_description: format!(
+                "{} ({:?}, {:?})",
+                info.name, info.backend, info.device_type
+            ),
         })
     }
 
@@ -447,6 +675,11 @@ impl GpuGemm {
 
     pub fn adapter(&self) -> &str {
         &self.adapter
+    }
+
+    /// One-line adapter summary, e.g. `NVIDIA GeForce GTX 1080 (Vulkan, DiscreteGpu)`.
+    pub fn adapter_description(&self) -> &str {
+        &self.adapter_description
     }
 
     /// `C[m][n] = A[m][k] @ W[n][k]^T`.
@@ -1514,5 +1747,107 @@ impl<'a> BulkUpload<'a> {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_maps_every_documented_spec() {
+        assert_eq!(DeviceSelector::parse("").unwrap(), DeviceSelector::Auto);
+        assert_eq!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto);
+        assert_eq!(DeviceSelector::parse("AUTO").unwrap(), DeviceSelector::Auto);
+        assert_eq!(DeviceSelector::parse(" cpu ").unwrap(), DeviceSelector::Cpu);
+        assert_eq!(DeviceSelector::parse("#1").unwrap(), DeviceSelector::Index(1));
+        assert_eq!(DeviceSelector::parse("2").unwrap(), DeviceSelector::Index(2));
+
+        for (spec, api) in [
+            ("vulkan", wgpu::Backend::Vulkan),
+            ("VULKAN:1", wgpu::Backend::Vulkan),
+            ("metal", wgpu::Backend::Metal),
+            ("metal:3", wgpu::Backend::Metal),
+            ("dx12", wgpu::Backend::Dx12),
+            ("d3d12:2", wgpu::Backend::Dx12),
+            ("gl", wgpu::Backend::Gl),
+        ] {
+            let index = spec.split_once(':').map_or(0, |(_, i)| i.parse().unwrap());
+            assert_eq!(
+                DeviceSelector::parse(spec).unwrap(),
+                DeviceSelector::Runtime { api, index },
+                "{spec}"
+            );
+        }
+
+        // Anything else is a name, matched case-insensitively against the adapter name.
+        assert_eq!(
+            DeviceSelector::parse("GeForce").unwrap(),
+            DeviceSelector::Name("geforce".into())
+        );
+        assert_eq!(
+            DeviceSelector::parse("pci:0").unwrap(),
+            DeviceSelector::Name("pci:0".into())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_backend_names_and_bad_indices() {
+        // `gpu` names a backend, not an adapter.
+        assert!(DeviceSelector::parse("gpu").is_err());
+        assert!(DeviceSelector::parse("#abc").is_err());
+        assert!(DeviceSelector::parse("vulkan:abc").is_err());
+        // A bad index must not silently become a name.
+        assert!(!matches!(
+            DeviceSelector::parse("#abc"),
+            Ok(DeviceSelector::Name(_))
+        ));
+    }
+
+    #[test]
+    fn auto_ranks_discrete_before_integrated_before_virtual_before_cpu() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
+        assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
+        assert!(device_class(VirtualGpu) < device_class(Cpu));
+        // A CPU adapter is not a GPU, so `Auto` never picks one.
+        assert!(!is_real_gpu(Cpu));
+        assert!(is_real_gpu(DiscreteGpu));
+        assert!(is_real_gpu(IntegratedGpu));
+        assert!(is_real_gpu(VirtualGpu));
+    }
+
+    #[test]
+    fn api_rank_is_the_order_table() {
+        use wgpu::Backend as B;
+        // The table is the ranking: listed backends rank 0..3 in its order.
+        for (i, backend) in API_RANK_ORDER.iter().enumerate() {
+            assert_eq!(api_rank(*backend), i as u8, "{backend:?}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(api_rank(B::Metal) < api_rank(B::Vulkan));
+            assert!(api_rank(B::Vulkan) < api_rank(B::Dx12));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(api_rank(B::Vulkan) < api_rank(B::Metal));
+            assert!(api_rank(B::Metal) < api_rank(B::Dx12));
+        }
+        assert!(api_rank(B::Dx12) < api_rank(B::Gl));
+        // Anything unlisted ranks last.
+        assert_eq!(api_rank(B::BrowserWebGpu), 4);
+        assert_eq!(api_rank(B::Noop), 4);
+    }
+
+    #[test]
+    fn rank_orders_device_class_before_api() {
+        use wgpu::Backend::{Dx12, Vulkan};
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(rank(DiscreteGpu, Vulkan) < rank(IntegratedGpu, Vulkan));
+        assert!(rank(IntegratedGpu, Vulkan) < rank(VirtualGpu, Vulkan));
+        assert!(rank(VirtualGpu, Vulkan) < rank(Cpu, Vulkan));
+        // Class wins over API: a discrete DX12 adapter beats an integrated Vulkan one.
+        assert!(rank(DiscreteGpu, Dx12) < rank(IntegratedGpu, Vulkan));
     }
 }
