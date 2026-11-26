@@ -1,0 +1,13 @@
+# local build output
+/target/
+
+# local logs & scratch
+*.log
+.tmp/
+
+# local dev notes, fixtures, and weights (kept out of the published tree)
+/HANDOFF.md
+/docs/
+/golden/
+/nemo/
+/test_data/
