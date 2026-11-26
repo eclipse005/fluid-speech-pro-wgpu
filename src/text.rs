@@ -318,10 +318,16 @@ impl Tokenizer {
             let Some(piece) = self.piece(tokens[index].id) else {
                 continue;
             };
-            let Some(first) = piece.chars().next() else {
-                continue;
+            // NeMo `_refine_timestamps_tdt` checks `decoded_piece in supported_punctuation`
+            // (after stripping `▁`, so tokens like `"▁¿"` are recognized as single punctuation
+            // marks, while multi-character tokens or `<unk>` (`" ⁇ "`) are not).
+            let decoded = clean_piece(piece);
+            let mut chars = decoded.chars();
+            let is_single_punct = match (chars.next(), chars.next()) {
+                (Some(ch), None) => ch != '⁇' && self.punctuation.contains(&ch),
+                _ => false,
             };
-            if index > 0 && self.punctuation.contains(&first) {
+            if index > 0 && is_single_punct {
                 let anchored = offsets[index - 1].1;
                 offsets[index] = (anchored, anchored);
             }
