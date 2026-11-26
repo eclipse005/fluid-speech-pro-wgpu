@@ -209,6 +209,7 @@ pub struct PreEncodeGpu {
     conv6_b: wgpu::Buffer,
     out_w: wgpu::Buffer,
     out_b: wgpu::Buffer,
+    out_bias: Vec<f32>,
 
     scratch: Option<PreScratch>,
     /// `[steps][D_MODEL]` holding a whole utterance. Bounded by a copy per chunk
@@ -301,6 +302,9 @@ impl PreEncodeGpu {
         let (conv5_w, conv5_b) = load_3x3("encoder.pre_encode.conv.5")?;
         let (conv6_w, conv6_b) = load_linear("encoder.pre_encode.conv.6")?;
         let (out_w, out_b) = load_linear("encoder.pre_encode.out")?;
+        let out_bias = store
+            .f32("encoder.pre_encode.out.bias")
+            .context("read encoder.pre_encode.out.bias")?;
 
         Ok(Self {
             gpu,
@@ -323,6 +327,7 @@ impl PreEncodeGpu {
             conv6_b,
             out_w,
             out_b,
+            out_bias,
             scratch: None,
             dest: None,
             dest_rows: 0,
@@ -526,9 +531,10 @@ impl PreEncodeGpu {
     /// Same stack, with the result copied back to the host.
     pub fn forward(&mut self, mel_time_major: &[f32], frames: usize) -> Result<(Vec<f32>, usize)> {
         let (result, valid4) = self.record(mel_time_major, frames)?;
-        let count = valid4 * D_MODEL;
+        let full = crate::pre_encode::total_steps(frames);
+        let count = full * D_MODEL;
         let byte_len = (count * 4) as u64;
-        self.ensure_host_read(valid4);
+        self.ensure_host_read(full);
         let mut encoder = self.gpu.encoder("pre_readback");
         encoder.copy_buffer_to_buffer(
             &result,
@@ -560,17 +566,29 @@ impl PreEncodeGpu {
 
     /// Runs the stack over the whole utterance and submits it.
     ///
-    /// Returns the buffer holding `[valid][D_MODEL]` and `valid`. Long audio is
+    /// Returns the buffer holding `[total_steps(frames)][D_MODEL]` and `valid`. Long audio is
     /// processed in time chunks so the conv stack's peak grid stops growing with the
     /// utterance; each chunk's kept rows are copied into one whole-utterance buffer,
     /// which is what makes a 25-minute clip fit.
     fn record(&mut self, mel_time_major: &[f32], frames: usize) -> Result<(wgpu::Buffer, usize)> {
-        let total = crate::pre_encode::valid_steps(frames);
-        if total == 0 {
+        let valid_total = crate::pre_encode::valid_steps(frames);
+        let full_total = crate::pre_encode::total_steps(frames);
+        if valid_total == 0 {
             bail!("input too short: {frames} frames subsample to 0");
         }
         let plan = crate::pre_encode::plan_chunks(frames);
-        self.ensure_dest(total);
+        self.ensure_dest(full_total);
+
+        if full_total > valid_total {
+            let dest = self.dest.as_ref().expect("dest initialized");
+            for row in valid_total..full_total {
+                self.gpu.queue_ref().write_buffer(
+                    dest,
+                    (row * D_MODEL * 4) as u64,
+                    bytemuck::cast_slice(&self.out_bias),
+                );
+            }
+        }
 
         for chunk in &plan {
             let start = chunk.start * FEAT_IN;
@@ -598,7 +616,7 @@ impl PreEncodeGpu {
             self.gpu.queue_ref().submit(Some(encoder.finish()));
         }
 
-        Ok((self.dest.as_ref().expect("dest initialized").clone(), total))
+        Ok((self.dest.as_ref().expect("dest initialized").clone(), valid_total))
     }
 
     /// Grows `dest` to hold `rows` encoder steps.

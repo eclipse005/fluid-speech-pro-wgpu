@@ -583,7 +583,9 @@ impl Transcriber {
                 let (out, steps): (GreedyOutput, usize) = match &mut self.stages {
                     Stages::Cpu(cpu) => {
                         let (mut features, valid) = cpu.pre.forward(&time_major, frames)?;
-                        cpu.insert.apply(&mut features, valid)?;
+                        let pre_steps = features.len() / crate::pre_encode::D_MODEL;
+                        cpu.insert.apply(&mut features, pre_steps)?;
+                        features.truncate(valid * crate::pre_encode::D_MODEL);
                         let encoded = cpu.encoder.forward(&features, valid)?;
                         let out = cpu.decoder.decode_greedy(
                             &encoded,
@@ -597,10 +599,11 @@ impl Transcriber {
                     }
                     Stages::Gpu(device) => {
                         let (feat, valid) = device.pre.forward_resident(&time_major, frames)?;
+                        let pre_steps = crate::pre_encode::total_steps(frames);
                         let feat = feat.clone();
-                        device.insert.ensure_capacity(valid);
+                        device.insert.ensure_capacity(pre_steps);
                         device.encoder.ensure_capacity(valid)?;
-                        device.insert.submit_apply_at(&feat, valid);
+                        device.insert.submit_apply_at(&feat, pre_steps);
                         let features = device.insert.output().clone();
                         let resident = device
                             .encoder
@@ -646,7 +649,9 @@ impl Transcriber {
                 let (hyps, steps): (Vec<BeamHypothesis>, usize) = match &mut self.stages {
                     Stages::Cpu(cpu) => {
                         let (mut features, valid) = cpu.pre.forward(&time_major, frames)?;
-                        cpu.insert.apply(&mut features, valid)?;
+                        let pre_steps = features.len() / crate::pre_encode::D_MODEL;
+                        cpu.insert.apply(&mut features, pre_steps)?;
+                        features.truncate(valid * crate::pre_encode::D_MODEL);
                         let encoded = cpu.encoder.forward(&features, valid)?;
                         let enc_proj = cpu.decoder.project_encoder_cpu(&encoded, valid)?;
                         let hyps = run_beam_strategy(
@@ -662,10 +667,11 @@ impl Transcriber {
                     }
                     Stages::Gpu(device) => {
                         let (feat, valid) = device.pre.forward_resident(&time_major, frames)?;
+                        let pre_steps = crate::pre_encode::total_steps(frames);
                         let feat = feat.clone();
-                        device.insert.ensure_capacity(valid);
+                        device.insert.ensure_capacity(pre_steps);
                         device.encoder.ensure_capacity(valid)?;
-                        device.insert.submit_apply_at(&feat, valid);
+                        device.insert.submit_apply_at(&feat, pre_steps);
                         let features = device.insert.output().clone();
                         let resident = device
                             .encoder

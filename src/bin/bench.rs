@@ -92,9 +92,11 @@ fn bench_steady_command(
             time_major[frame * bins + bin] = mel_features[bin * frames + frame];
         }
     }
-    let (mut probe, _) = pre.forward(&time_major, frames)?;
-    let steps = probe.len() / pre_encode::D_MODEL;
-    insert.apply(&mut probe, steps)?;
+    let (mut probe, valid_steps) = pre.forward(&time_major, frames)?;
+    let pre_steps = probe.len() / pre_encode::D_MODEL;
+    let steps = valid_steps;
+    insert.apply(&mut probe, pre_steps)?;
+    probe.truncate(steps * pre_encode::D_MODEL);
 
     let started = std::time::Instant::now();
     // Only build the CPU Conformer when actually benchmarking CPU; loading 2.3 GB of
@@ -136,7 +138,7 @@ fn bench_steady_command(
     let d_pre = t_pre.elapsed();
     let t_fv = std::time::Instant::now();
     let fv_gpu = match &gpu_encoder {
-        Some(gpu) => Some(fv_insert_gpu::FvInsertGpu::new(gpu.gpu(), steps, &bundle.store)?),
+        Some(gpu) => Some(fv_insert_gpu::FvInsertGpu::new(gpu.gpu(), pre_steps, &bundle.store)?),
         None => None,
     };
     let d_fv = t_fv.elapsed();
@@ -189,12 +191,14 @@ fn bench_steady_command(
             let _ = tokenizer.decode(&ids);
             return Ok(ids);
         }
-        let (mut features, _valid) = match pre_gpu {
+        let (mut features, valid) = match pre_gpu {
             Some(gpu) => gpu.forward(&time_major, frames)?,
             None => pre.forward(&time_major, frames)?,
         };
-        let steps = features.len() / pre_encode::D_MODEL;
-        insert.apply(&mut features, steps)?;
+        let pre_rows = features.len() / pre_encode::D_MODEL;
+        insert.apply(&mut features, pre_rows)?;
+        features.truncate(valid * pre_encode::D_MODEL);
+        let steps = valid;
         let tokens = match &gpu_encoder {
             Some(gpu) if tdt_on_gpu => {
                 // The encoder output stays in VRAM: the decoder reads it directly.
@@ -266,16 +270,18 @@ fn bench_steady_command(
             tdt_time = mark.elapsed();
         } else {
             let mark = std::time::Instant::now();
-            let (mut host_features, _valid) = match &mut pre_gpu {
+            let (mut host_features, valid_here) = match &mut pre_gpu {
                 Some(gpu) => gpu.forward(&tm, frames)?,
                 None => pre.forward(&tm, frames)?,
             };
             pre_time = mark.elapsed();
-            let steps_here = host_features.len() / pre_encode::D_MODEL;
+            let pre_rows = host_features.len() / pre_encode::D_MODEL;
 
             let mark = std::time::Instant::now();
-            insert.apply(&mut host_features, steps_here)?;
+            insert.apply(&mut host_features, pre_rows)?;
+            host_features.truncate(valid_here * pre_encode::D_MODEL);
             insert_time = mark.elapsed();
+            let steps_here = valid_here;
 
             let mark = std::time::Instant::now();
             let encoded_host = match &gpu_encoder {

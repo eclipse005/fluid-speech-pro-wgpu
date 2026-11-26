@@ -161,9 +161,11 @@ fn encoder_command(
 
     let (time_major, frames) = load_features(&frontend, input)?;
 
-    let (mut features, _valid) = pre.forward(&time_major, frames)?;
-    let steps = features.len() / pre_encode::D_MODEL;
-    insert.apply(&mut features, steps)?;
+    let (mut features, valid) = pre.forward(&time_major, frames)?;
+    let pre_steps = features.len() / pre_encode::D_MODEL;
+    insert.apply(&mut features, pre_steps)?;
+    features.truncate(valid * pre_encode::D_MODEL);
+    let steps = valid;
 
     let encoder = conformer::Conformer::from_store(&bundle.store)?;
     let started = std::time::Instant::now();
@@ -261,9 +263,11 @@ fn dump_encoder_input_command(nemo_path: &Path, mel: &Path, out_path: &Path) -> 
     let insert = fv_insert::FvInsert::from_store(&bundle.store)?;
 
     let (time_major, frames) = load_features(&frontend, mel)?;
-    let (mut features, _valid) = pre.forward(&time_major, frames)?;
-    let steps = features.len() / pre_encode::D_MODEL;
-    insert.apply(&mut features, steps)?;
+    let (mut features, valid) = pre.forward(&time_major, frames)?;
+    let pre_steps = features.len() / pre_encode::D_MODEL;
+    insert.apply(&mut features, pre_steps)?;
+    features.truncate(valid * pre_encode::D_MODEL);
+    let steps = valid;
 
     let mut bytes = Vec::with_capacity(features.len() * 4);
     for value in &features {
@@ -1003,9 +1007,11 @@ fn tdt_compare_command(nemo_path: &Path, wav_path: &Path) -> Result<()> {
             time_major[frame * bins + bin] = mel_features[bin * frames + frame];
         }
     }
-    let (mut features, _valid) = pre.forward(&time_major, frames)?;
-    let steps = features.len() / pre_encode::D_MODEL;
-    insert.apply(&mut features, steps)?;
+    let (mut features, valid) = pre.forward(&time_major, frames)?;
+    let pre_steps = features.len() / pre_encode::D_MODEL;
+    insert.apply(&mut features, pre_steps)?;
+    features.truncate(valid * pre_encode::D_MODEL);
+    let steps = valid;
     let encoded = encoder.forward(&features, steps)?;
 
     let mut host = tdt::TdtDecoder::from_store(&bundle.store)?;
@@ -1172,10 +1178,11 @@ fn gpu_batch_command(nemo_path: &Path, list_path: &Path, out_path: &Path) -> Res
         // Same resident chain the benchmark uses: pre_encode -> fv_insert -> encoder
         // -> decoder, so the alignment check covers the production path.
         let (feat_buf, steps) = pre_gpu.forward_resident(&time_major, frames)?;
+        let pre_steps = pre_encode::total_steps(frames);
 
         let started = std::time::Instant::now();
         let insert_gpu =
-            fv_insert_gpu::FvInsertGpu::new(std::sync::Arc::clone(&shared_gpu), steps, &bundle.store)?;
+            fv_insert_gpu::FvInsertGpu::new(std::sync::Arc::clone(&shared_gpu), pre_steps, &bundle.store)?;
         insert_gpu.submit_apply(&feat_buf);
         let encoder = gpu_encoder::EncoderGpu::with_gpu(
             std::sync::Arc::clone(&shared_gpu),

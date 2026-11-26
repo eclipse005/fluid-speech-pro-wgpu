@@ -137,24 +137,29 @@ impl PreEncode {
                 mel_time_major.len()
             );
         }
-        let total = valid_steps(frames);
+        let valid = valid_steps(frames);
+        let full = total_steps(frames);
         let plan = plan_chunks(frames);
         // One chunk with no margin to drop is the ordinary short-utterance case.
         if plan.len() <= 1 {
-            return self.forward_block(mel_time_major, frames);
+            let (mut out, valid) = self.forward_block(mel_time_major, frames)?;
+            for _ in valid..full {
+                out.extend_from_slice(&self.out_bias);
+            }
+            return Ok((out, valid));
         }
 
         // Long audio: each chunk is an ordinary forward over a slice, and the rows
         // its padding distorts are dropped at the seam. Peak memory is bounded by
         // `CHUNK_GRID_BYTES` instead of by the utterance length.
-        let mut out = vec![0.0f32; total * D_MODEL];
+        let mut out = vec![0.0f32; full * D_MODEL];
         for chunk in &plan {
             let start = chunk.start * FEAT_IN;
             let end = (chunk.start + chunk.len) * FEAT_IN;
-            let (block, valid) = self.forward_block(&mel_time_major[start..end], chunk.len)?;
-            if valid < chunk.keep_from + chunk.rows {
+            let (block, chunk_valid) = self.forward_block(&mel_time_major[start..end], chunk.len)?;
+            if chunk_valid < chunk.keep_from + chunk.rows {
                 bail!(
-                    "chunk at {} produced {valid} rows, needs {}",
+                    "chunk at {} produced {chunk_valid} rows, needs {}",
                     chunk.start,
                     chunk.keep_from + chunk.rows
                 );
@@ -164,7 +169,10 @@ impl PreEncode {
             let at = chunk.first_row * D_MODEL;
             out[at..at + take].copy_from_slice(&block[from..from + take]);
         }
-        Ok((out, total))
+        for row in valid..full {
+            out[row * D_MODEL..(row + 1) * D_MODEL].copy_from_slice(&self.out_bias);
+        }
+        Ok((out, valid))
     }
 
     /// One chunk: the conv stack plus the projection, with no chunking of its own.
@@ -396,7 +404,7 @@ pub(crate) fn check_frames(frames: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Frame count this stage emits for `frames` mel frames.
+/// Frame count this stage marks valid for `frames` mel frames (`enc_len`).
 ///
 /// Mirrors the `valid` chain in [`PreEncode::forward`] without allocating, so a caller
 /// can size buffers before running anything.
@@ -411,6 +419,24 @@ pub fn valid_steps(frames: usize) -> usize {
         valid = out(valid, kernel, stride, padding);
     }
     valid
+}
+
+/// Total rows emitted by `pre_encode.out` for `frames` mel frames, including any
+/// trailing padding row (`total_steps == valid_steps + 1` iff `frames % 8 == 1`).
+///
+/// NeMo's `MaskedConvSequential` zeros row `valid` before `pre_encode.out`, so row `valid`
+/// leaves `pre_encode.out` equal to `out.bias` and enters `fv_insert`'s depthwise Conv1d(15).
+pub fn total_steps(frames: usize) -> usize {
+    fn out(len: usize, kernel: usize, stride: usize, padding: usize) -> usize {
+        (len + 2 * padding)
+            .checked_sub(kernel)
+            .map_or(0, |span| span / stride + 1)
+    }
+    let mut steps = frames;
+    for (kernel, stride, padding) in [(3, 2, 1), (3, 2, 1), (1, 1, 0), (3, 2, 1), (1, 1, 0)] {
+        steps = out(steps, kernel, stride, padding);
+    }
+    steps
 }
 
 /// `calculate_conv_output_size` for one axis.
@@ -591,6 +617,20 @@ mod tests {
         assert_eq!(plan[0].keep_from, 0);
         assert_eq!(plan[0].rows, valid_steps(1440));
         assert_eq!(plan[0].start, 0);
+    }
+
+    #[test]
+    fn total_steps_adds_one_padding_row_iff_frames_mod_8_is_1() {
+        for frames in 8usize..2000 {
+            let expected = valid_steps(frames) + usize::from(frames % 8 == 1);
+            assert_eq!(total_steps(frames), expected, "frames={frames}");
+        }
+        assert_eq!(total_steps(985), 124);
+        assert_eq!(valid_steps(985), 123);
+        assert_eq!(total_steps(721), 91);
+        assert_eq!(valid_steps(721), 90);
+        assert_eq!(total_steps(1745), 219);
+        assert_eq!(valid_steps(1745), 218);
     }
 
     #[test]
